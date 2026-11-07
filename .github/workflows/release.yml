@@ -1,10 +1,12 @@
 name: Release
 
 # Builds the IPK (native watcher + web app) and publishes a GitHub release.
-# Run it by pushing a tag that matches app/appinfo.json (e.g. v1.5.0), or from
-# Actions -> Release -> Run workflow, which tags the selected branch itself.
+# Runs automatically when a push to main carries a version in
+# app/appinfo.json that has no release yet. It can also be started by pushing
+# a matching tag (e.g. v1.5.1) or from Actions -> Release -> Run workflow.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -12,19 +14,23 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Read version
-        id: version
+      - name: Decide whether to publish
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           VERSION=$(node -p "JSON.parse(require('fs').readFileSync('app/appinfo.json')).version")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -33,6 +39,22 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match app/appinfo.json version $VERSION"
             exit 1
           fi
+          PUBLISH=true
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "branch" ] \
+            && gh release view "v$VERSION" >/dev/null 2>&1; then
+            PUBLISH=false
+            echo "Release v$VERSION already exists; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
@@ -54,7 +76,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp build/com.github.nikolay1243.earcvolume_${{ steps.version.outputs.version }}_all.ipk dist/
+          cp build/com.github.nikolay1243.earcvolume_${{ needs.check.outputs.version }}_all.ipk dist/
           cp build/release/*.manifest.json build/release/repo.json dist/
           cp build/native/earc-watcher-armv7 build/native/earc-watcher-aarch64 dist/
           (cd dist && sha256sum * > SHA256SUMS)
@@ -64,7 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           NOTES="docs/releases/$TAG.md"
           if ! gh release view "$TAG" >/dev/null 2>&1; then

@@ -210,8 +210,10 @@ publish from Actions → Publish release → Run workflow; its write permission 
 limited to the publishing job and it does not run on pull requests.
 
 The **Release** workflow (`.github/workflows/release.yml`) works in any fork.
-Push a tag matching `app/appinfo.json` (for example `v1.5.0`), or run it from
-Actions → Release → Run workflow. It runs the tests, builds the native watcher
+It publishes automatically when a push to `main` carries a version in
+`app/appinfo.json` that has no release yet, so bumping the version is all a
+release needs. It can also be started by pushing a matching tag (for example
+`v1.5.1`) or from Actions → Release → Run workflow. It runs the tests, builds the native watcher
 and the IPK, and publishes a release with the IPK, its Homebrew manifest, a
 `repo.json` index, the standalone watcher binaries and `SHA256SUMS`. All URLs
 point at the repository that ran it, so a fork can be added to Homebrew Channel

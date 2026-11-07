@@ -202,6 +202,14 @@ as GitHub Release assets. The repository's old `release/` downloads are retired;
 publish from Actions → Publish release → Run workflow; its write permission is
 limited to the publishing job and it does not run on pull requests.
 
+The **Release** workflow (`.github/workflows/release.yml`) works in any fork.
+Push a tag matching `app/appinfo.json` (for example `v1.5.0`), or run it from
+Actions → Release → Run workflow. It runs the tests, builds the native watcher
+and the IPK, and publishes a release with the IPK, its Homebrew manifest, a
+`repo.json` index, the standalone watcher binaries and `SHA256SUMS`. All URLs
+point at the repository that ran it, so a fork can be added to Homebrew Channel
+with `https://github.com/OWNER/REPO/releases/latest/download/repo.json`.
+
 ## Development disclosure
 
 This project was developed with substantial assistance from OpenAI Codex. The

@@ -1,0 +1,78 @@
+name: Release
+
+# Builds the IPK (native watcher + web app) and publishes a GitHub release.
+# Run it by pushing a tag that matches app/appinfo.json (e.g. v1.5.0), or from
+# Actions -> Release -> Run workflow, which tags the selected branch itself.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('app/appinfo.json')).version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match app/appinfo.json version $VERSION"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf,aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: watcher-rs
+      - run: pip install ziglang cargo-zigbuild
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run package
+      - run: node scripts/release-metadata.mjs
+
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp build/com.github.nikolay1243.earcvolume_${{ steps.version.outputs.version }}_all.ipk dist/
+          cp build/release/*.manifest.json build/release/repo.json dist/
+          cp build/native/earc-watcher-armv7 build/native/earc-watcher-aarch64 dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          NOTES="docs/releases/$TAG.md"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            if [ -f "$NOTES" ]; then
+              gh release create "$TAG" --target "$GITHUB_SHA" --title "eARC Volume Overlay $TAG" --notes-file "$NOTES"
+            else
+              gh release create "$TAG" --target "$GITHUB_SHA" --title "eARC Volume Overlay $TAG" --generate-notes
+            fi
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          echo "Homebrew Channel repository URL: https://github.com/$GH_REPO/releases/latest/download/repo.json" >> "$GITHUB_STEP_SUMMARY"

@@ -9,6 +9,8 @@ permissions:
   contents: read
 jobs:
   publish:
+    # Also refreshes release/ manifests on main; forks use release.yml instead.
+    if: github.repository == 'Nikolay1243/Webos-EARC-Volume-Overlay'
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -2,7 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::Event;
+use crate::learn::{Dir, Name, Outcome, Steps};
+use crate::{Event, Key};
 
 /// How long to wait for the soundbar's answer to a key press before the
 /// dimmed value is shown as final (e.g. a press at 0 or 100 that changes nothing).
@@ -27,6 +28,18 @@ pub struct Show {
     pub pending: bool,
 }
 
+/// A key press still waiting for the soundbar's answer.
+#[derive(Debug, Clone, Copy)]
+struct Press {
+    /// The level the press started from, if known.
+    from: Option<u8>,
+    /// True when `from` is a level the soundbar confirmed (not a prediction).
+    from_confirmed: bool,
+    dir: Option<Dir>,
+    /// The level shown in advance, if the step was learned.
+    predicted: Option<u8>,
+}
+
 #[derive(Default)]
 pub struct Engine {
     arc: Option<bool>,
@@ -44,6 +57,14 @@ pub struct Engine {
     /// Previous polled value; a poll counts as a change only against this,
     /// never against a CEC report or seed of a different age.
     last_polled: Option<u8>,
+    /// Presses sent to the soundbar and not answered yet, oldest first.
+    presses: Vec<Press>,
+    /// Learned volume steps of the current soundbar.
+    steps: Steps,
+    soundbar: Option<Name>,
+    steps_dirty: bool,
+    /// Predicted level after the presses in flight; None when unknown.
+    virtual_level: Option<u8>,
 }
 
 impl Engine {
@@ -76,16 +97,64 @@ impl Engine {
         self.silent >= SILENT_BEFORE_HIDING
     }
 
-    /// A volume or mute key was pressed: show the last level at once, dimmed.
-    fn press(&mut self, now: Instant) -> Option<Show> {
+    pub fn soundbar(&self) -> Option<Name> {
+        self.soundbar
+    }
+
+    pub fn steps(&self) -> &Steps {
+        &self.steps
+    }
+
+    /// True once after the learned steps changed, so the caller can save them.
+    pub fn take_steps_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.steps_dirty)
+    }
+
+    /// Switches to another soundbar's learned steps. Steps learned before the
+    /// soundbar was positively identified are kept where the new table has none.
+    pub fn set_soundbar(&mut self, name: Name, mut loaded: Steps) {
+        let weak = self.soundbar.is_none_or(|n| !n.strong);
+        if weak {
+            loaded.merge_missing(&self.steps);
+            self.steps_dirty = !self.steps.is_empty();
+        }
+        self.soundbar = Some(name);
+        self.steps = loaded;
+        self.presses.clear();
+        self.virtual_level = self.volume;
+    }
+
+    /// A volume or mute key was pressed: show the learned next level at once,
+    /// or the last level dimmed while the soundbar's answer is on its way.
+    fn press(&mut self, key: Option<Key>, now: Instant) -> Option<Show> {
         if !self.allowed() {
             return None;
         }
         self.awaiting = Some(now);
         if self.starved() {
+            self.presses.clear();
             return None;
         }
-        let volume = self.volume?;
+        let dir = match key {
+            Some(Key::VolumeUp) => Some(Dir::Up),
+            Some(Key::VolumeDown) => Some(Dir::Down),
+            _ => None,
+        };
+        let from = if self.presses.is_empty() { self.volume } else { self.virtual_level };
+        let from_confirmed = self.presses.is_empty() && self.volume.is_some();
+        let predicted = match (from, dir) {
+            (Some(level), Some(d)) if !self.mute => self.steps.predict(level, d),
+            _ => None,
+        };
+        if self.presses.len() < 16 {
+            self.presses.push(Press { from, from_confirmed, dir, predicted });
+        }
+        self.virtual_level = predicted;
+        if let Some(volume) = predicted {
+            self.last_pending_show = None;
+            return Some(Show { volume, mute: self.mute, pending: false });
+        }
+        let volume = from.or(self.volume)?;
         if self.last_pending_show.is_some_and(|t| now.duration_since(t) < PENDING_REPEAT) {
             return None;
         }
@@ -95,11 +164,19 @@ impl Engine {
 
     pub fn handle(&mut self, event: Event, now: Instant) -> Option<Show> {
         match event {
-            Event::Key(_) => self.press(now),
+            Event::Key(key) => self.press(Some(key), now),
             Event::Report { volume, mute } => {
                 self.unanswered = 0;
                 self.silent = 0;
                 self.last_polled = None;
+                if let Some(true) = self.answer(volume, mute) {
+                    // The level shown in advance was right; nothing to update.
+                    if self.presses.is_empty() {
+                        self.awaiting = None;
+                    }
+                    self.last_pending_show = None;
+                    return None;
+                }
                 let changed = self.volume.is_some_and(|v| v != volume) || (self.volume.is_some() && self.mute != mute);
                 self.volume = Some(volume);
                 self.mute = mute;
@@ -140,7 +217,7 @@ impl Engine {
                     return None;
                 }
                 self.mute = mute;
-                self.press(now)
+                self.press(None, now)
             }
             Event::CecLog(present) => {
                 self.log_present = Some(present);
@@ -159,9 +236,12 @@ impl Engine {
                 if !arc {
                     self.awaiting = None;
                     self.last_pending_show = None;
+                    self.presses.clear();
                 }
                 None
             }
+            // Loading the soundbar's learned steps is done by the caller.
+            Event::Soundbar(_) => None,
             Event::Seed(volume) => {
                 if self.volume.is_none() {
                     self.volume = Some(volume);
@@ -181,10 +261,58 @@ impl Engine {
         self.last_pending_show = None;
         self.unanswered = self.unanswered.saturating_add(1);
         self.silent = self.silent.saturating_add(1);
-        if !self.allowed() || self.starved() {
+        let predicted_shown = self.presses.iter().any(|p| p.predicted.is_some());
+        self.presses.clear();
+        self.virtual_level = self.volume;
+        if !self.allowed() || self.starved() || predicted_shown {
+            // A level shown in advance stays on screen as it was; no newer
+            // confirmed value exists to replace it with.
             return None;
         }
         Some(Show { volume: self.volume?, mute: self.mute, pending: false })
+    }
+
+    /// Matches a soundbar report against the presses in flight and learns from it.
+    /// Returns Some(true) when the report confirms what is already on screen,
+    /// Some(false) when it answered presses but the screen needs the real value,
+    /// and None when no press was waiting (e.g. the soundbar's own remote).
+    fn answer(&mut self, volume: u8, mute: bool) -> Option<bool> {
+        if self.presses.is_empty() {
+            self.virtual_level = Some(volume);
+            return None;
+        }
+        let single = self.presses.len() == 1;
+        let first = self.presses[0];
+        // Learn only from one isolated press that started at a confirmed level;
+        // held keys may get one combined answer for several presses.
+        if single && first.from_confirmed && !mute && !self.mute {
+            if let (Some(from), Some(dir)) = (first.from, first.dir) {
+                match self.steps.confirm(from, dir, volume) {
+                    Outcome::Agreed { changed } => self.steps_dirty |= changed,
+                    Outcome::Contradicted => {
+                        self.steps_dirty = true;
+                        crate::log(&format!(
+                            "learned step {} {:?} was wrong (soundbar said {}); relearning",
+                            from, dir, volume
+                        ));
+                    }
+                }
+            }
+        }
+        // A report matching one of the predictions answers every press up to it.
+        if let Some(i) = self.presses.iter().position(|p| p.predicted == Some(volume)) {
+            if mute == self.mute {
+                self.presses.drain(..=i);
+                if self.presses.is_empty() {
+                    self.virtual_level = Some(volume);
+                }
+                self.volume = Some(volume);
+                return Some(true);
+            }
+        }
+        self.presses.clear();
+        self.virtual_level = Some(volume);
+        Some(false)
     }
 
     pub fn next_deadline(&self, now: Instant) -> Option<Duration> {
@@ -376,4 +504,114 @@ mod tests {
         assert!(!e.wants_polling());
         assert!(!e.starved());
     }
+
+    fn learned(t0: Instant) -> Engine {
+        // C3 + Polk: from 14, volume up gives 16, seen twice.
+        let mut e = ready(t0, 14);
+        e.handle(Event::CecLog(true), t0);
+        for n in 0..2u64 {
+            let t = ms(t0, 5000 + n * 4000);
+            assert_eq!(e.handle(Event::Key(Key::VolumeUp), t), Some(Show { volume: 14, mute: false, pending: true }));
+            e.handle(Event::Report { volume: 16, mute: false }, ms(t, 600));
+            e.handle(Event::Key(Key::VolumeDown), ms(t, 2000));
+            e.handle(Event::Report { volume: 14, mute: false }, ms(t, 2600));
+        }
+        assert!(e.take_steps_dirty());
+        e
+    }
+
+    #[test]
+    fn learned_step_is_shown_at_once_and_confirmed_quietly() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        let t = ms(t0, 20000);
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), t), Some(Show { volume: 16, mute: false, pending: false }));
+        assert_eq!(e.handle(Event::Report { volume: 16, mute: false }, ms(t, 600)), None, "already on screen");
+        assert_eq!(e.next_deadline(ms(t, 700)), None);
+        assert_eq!(e.handle(Event::Key(Key::VolumeDown), ms(t, 2000)), Some(Show { volume: 14, mute: false, pending: false }));
+    }
+
+    #[test]
+    fn wrong_prediction_is_corrected_and_relearned() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        let t = ms(t0, 20000);
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), t).map(|s| s.volume), Some(16));
+        // Soundbar firmware changed its steps: it now goes 14 -> 15.
+        assert_eq!(
+            e.handle(Event::Report { volume: 15, mute: false }, ms(t, 600)),
+            Some(Show { volume: 15, mute: false, pending: false })
+        );
+        e.handle(Event::Key(Key::VolumeDown), ms(t, 2000));
+        e.handle(Event::Report { volume: 14, mute: false }, ms(t, 2600));
+        // The contradicted step is no longer predicted until confirmed again.
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 5000)).map(|s| s.pending), Some(true));
+        e.handle(Event::Report { volume: 15, mute: false }, ms(t, 5600));
+        e.handle(Event::Key(Key::VolumeDown), ms(t, 7000));
+        e.handle(Event::Report { volume: 14, mute: false }, ms(t, 7600));
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 9000)).map(|s| (s.volume, s.pending)), Some((15, false)));
+    }
+
+    #[test]
+    fn held_key_chains_predictions_without_learning() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        // Also learn 16 -> 18.
+        for n in 0..2u64 {
+            let t = ms(t0, 20000 + n * 4000);
+            e.handle(Event::Key(Key::VolumeUp), t);
+            e.handle(Event::Report { volume: 16, mute: false }, ms(t, 600));
+            e.handle(Event::Key(Key::VolumeUp), ms(t, 1500));
+            e.handle(Event::Report { volume: 18, mute: false }, ms(t, 2100));
+            e.handle(Event::Key(Key::VolumeDown), ms(t, 2500));
+            e.handle(Event::Report { volume: 16, mute: false }, ms(t, 3000));
+            e.handle(Event::Key(Key::VolumeDown), ms(t, 3300));
+            e.handle(Event::Report { volume: 14, mute: false }, ms(t, 3800));
+        }
+        let t = ms(t0, 40000);
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), t).map(|s| s.volume), Some(16));
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 200)).map(|s| s.volume), Some(18));
+        // From 18 nothing is learned: the third press shows 18 dimmed.
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 400)), Some(Show { volume: 18, mute: false, pending: true }));
+        e.take_steps_dirty();
+        // One combined answer for all three presses: shown, and nothing is learned from it.
+        assert_eq!(e.handle(Event::Report { volume: 20, mute: false }, ms(t, 900)).map(|s| s.volume), Some(20));
+        assert!(!e.take_steps_dirty());
+    }
+
+    #[test]
+    fn unanswered_prediction_stays_on_screen() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        let t = ms(t0, 20000);
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), t).map(|s| s.volume), Some(16));
+        assert_eq!(e.tick(ms(t, 1500)), None, "do not jump back to the old level");
+        // The next press starts again from the last confirmed level.
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 3000)).map(|s| s.volume), Some(16));
+    }
+
+    #[test]
+    fn no_prediction_while_muted_or_for_mute_key() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        let t = ms(t0, 20000);
+        assert_eq!(e.handle(Event::Key(Key::Mute), t).map(|s| s.pending), Some(true));
+        assert_eq!(e.handle(Event::Report { volume: 14, mute: true }, ms(t, 600)), Some(Show { volume: 14, mute: true, pending: false }));
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t, 2000)).map(|s| s.pending), Some(true));
+    }
+
+    #[test]
+    fn steps_follow_the_identified_soundbar() {
+        let t0 = Instant::now();
+        let mut e = learned(t0);
+        // Learned before identification; kept when the name becomes known.
+        let polk = crate::learn::Name::new("Polk_S4", true).unwrap();
+        e.set_soundbar(polk, crate::learn::Steps::default());
+        assert_eq!(e.steps().predict(14, crate::learn::Dir::Up), Some(16));
+        // A different soundbar brings its own (empty) table.
+        let other = crate::learn::Name::new("HW-Q990B", true).unwrap();
+        e.set_soundbar(other, crate::learn::Steps::default());
+        assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t0, 30000)).map(|s| s.pending), Some(true));
+    }
 }
+

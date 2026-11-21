@@ -160,9 +160,19 @@ A small native watcher (Rust, static ARM binary) follows the TV's own CEC log,
 `/var/log/cecmessages`, with inotify. It reads the soundbar's HDMI-CEC Report
 Audio Status messages (`RX507Axx`: volume in bits 0-6, mute in bit 7) and the
 TV's volume key presses to the soundbar (`TX0544xx`). Nothing is sent on the
-CEC bus. A key press shows the overlay at once with the last known level,
-dimmed; the soundbar's reply fills in the confirmed number. Changes made with
-the soundbar's own remote are shown as soon as it reports them.
+CEC bus. Changes made with the soundbar's own remote are shown as soon as it
+reports them.
+
+The watcher learns each soundbar's volume steps ("at 14, volume up gives 16")
+from its replies to single key presses. Once a step has been confirmed twice,
+a key press shows the next level immediately instead of waiting for the reply
+(about 600 ms on a Polk Signa S4). When at least four confirmed steps in one
+direction all have the same size, that size is also used for levels not
+visited yet. Until then, a press shows the last level dimmed and the reply
+fills in the number. A reply that contradicts a prediction replaces it on
+screen, and that step is relearned. Learned steps are kept per soundbar (by
+its CEC name) in `/var/lib/earc-volume-steps` and can be cleared with
+**Reset learning** on the setup screen.
 
 A single long-lived `luna-send` subscription tells the watcher whether sound
 goes to the ARC/eARC device, and the ARC getter is read once to seed the value.

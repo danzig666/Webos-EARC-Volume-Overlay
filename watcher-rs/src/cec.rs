@@ -11,10 +11,94 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use crate::learn::Name;
 use crate::{debug, log, Event, Key};
 
 const MAX_BACKLOG: u64 = 65536;
 const MISSING_GRACE: Duration = Duration::from_secs(5);
+/// How much of the existing log is scanned at start to identify the soundbar.
+const IDENTITY_SCAN: u64 = 512 * 1024;
+
+/// Finds the audio system's (logical address 5) name in the log: its Set OSD
+/// Name message (`RX5047` + ASCII hex), the TV's periodic device dump
+/// (`LADDR:0x05` then `OSD(name)`), or as a weaker stand-in its vendor id.
+#[derive(Default)]
+pub struct Identity {
+    after_laddr5: bool,
+    best: Option<Name>,
+}
+
+impl Identity {
+    fn parse(&mut self, line: &str) -> Option<Name> {
+        if line.contains("LADDR:") {
+            self.after_laddr5 = line.contains("LADDR:0x05");
+            return None;
+        }
+        if self.after_laddr5 {
+            if let Some(at) = line.find("OSD(") {
+                self.after_laddr5 = false;
+                let rest = &line[at + 4..];
+                return Name::new(&rest[..rest.find(')')?], true);
+            }
+        }
+        for token in line.split_ascii_whitespace() {
+            if let Some(hex) = token.strip_prefix("RX5047") {
+                if hex.len() % 2 != 0 || hex.is_empty() {
+                    return None;
+                }
+                let text: String = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .filter(|b| b.is_ascii_graphic() || *b == b' ')
+                    .map(|b| b as char)
+                    .collect();
+                return Name::new(&text, true);
+            }
+            if let Some(hex) = token.strip_prefix("RX5F87") {
+                if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Name::new(&format!("vendor-{}", hex.to_ascii_uppercase()), false);
+                }
+            }
+        }
+        None
+    }
+
+    /// Feeds one line; returns a name when the identity changed.
+    pub fn feed(&mut self, line: &str) -> Option<Name> {
+        let name = self.parse(line)?;
+        let better = match self.best {
+            None => true,
+            Some(b) if b.strong => name.strong && b != name,
+            Some(b) => name.strong || b != name,
+        };
+        if better {
+            self.best = Some(name);
+            Some(name)
+        } else {
+            None
+        }
+    }
+}
+
+/// Scans the end of the existing log for the soundbar's name.
+fn identify_from_backlog(path: &str, identity: &mut Identity) -> Option<Name> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(IDENTITY_SCAN))).ok()?;
+    let mut text = Vec::new();
+    file.read_to_end(&mut text).ok()?;
+    let mut last_strong = None;
+    let mut last_weak = None;
+    let mut scan = Identity::default();
+    for line in String::from_utf8_lossy(&text).lines() {
+        if let Some(n) = scan.parse(line) {
+            if n.strong { last_strong = Some(n) } else { last_weak = Some(n) }
+        }
+    }
+    let found = last_strong.or(last_weak)?;
+    identity.best = Some(found);
+    Some(found)
+}
 
 /// Parses one log line into an event, if it is one we care about.
 pub fn parse_line(line: &str) -> Option<Event> {
@@ -122,6 +206,12 @@ pub fn follow(path: &str, tx: Sender<Event>) {
     if tx.send(Event::CecLog(present)).is_err() {
         return;
     }
+    let mut identity = Identity::default();
+    if let Some(name) = identify_from_backlog(path, &mut identity) {
+        if tx.send(Event::Soundbar(name)).is_err() {
+            return;
+        }
+    }
     let mut missing_since: Option<Instant> = None;
     let mut pending: Vec<u8> = Vec::new();
 
@@ -175,6 +265,10 @@ pub fn follow(path: &str, tx: Sender<Event>) {
                 if tx.send(event).is_err() {
                     return;
                 }
+            } else if let Some(name) = identity.feed(&line) {
+                if tx.send(Event::Soundbar(name)).is_err() {
+                    return;
+                }
             }
             start += i + 1;
         }
@@ -213,5 +307,27 @@ mod tests {
         assert_eq!(parse_line("[CECMSG] RX507A0E00"), None);
         assert_eq!(parse_line("[CECMSG] RX407A10"), None);
         assert_eq!(parse_line(""), None);
+    }
+
+    #[test]
+    fn identifies_soundbar() {
+        let mut id = Identity::default();
+        // Vendor id first (weak), then the C2's device dump (strong).
+        let v = id.feed("2026-11-07T10:45:49.011876Z [CECMSG] TM158 RX5F870000F0").unwrap();
+        assert_eq!(v.as_str(), "vendor-0000F0");
+        assert!(!v.strong);
+        assert_eq!(id.feed("[INFO] [Display:403] LADDR:0x0B, FLAGs:0x2FE, 0:VendorId(0x00044B)"), None);
+        assert_eq!(id.feed("[INFO] [Display:409]  + 3:vdId(0x0F), 5:OSD(SHIELD), 6:pAddr(4000)"), None);
+        assert_eq!(id.feed("[INFO] [Display:403] LADDR:0x05, FLAGs:0x2FE(FIN?0xC0), 0:VendorId(0x0000F0)"), None);
+        let n = id.feed("[INFO] [Display:409]  + 3:vdId(0x0F), 4:pSt(0x03), 5:OSD(HW-Q990B), 6:pAddr(2000)").unwrap();
+        assert_eq!(n.as_str(), "HW-Q990B");
+        assert!(n.strong);
+        // Repeats and weaker names change nothing.
+        assert_eq!(id.feed("[INFO] [Display:403] LADDR:0x05, FLAGs:0x2FE"), None);
+        assert_eq!(id.feed("[INFO] [Display:409] 5:OSD(HW-Q990B)"), None);
+        assert_eq!(id.feed("[CECMSG] RX5F870000F0"), None);
+        // Set OSD Name: "Polk S4".
+        let p = id.feed("[CECMSG] TM1 RX5047506F6C6B205334").unwrap();
+        assert_eq!(p.as_str(), "Polk_S4");
     }
 }

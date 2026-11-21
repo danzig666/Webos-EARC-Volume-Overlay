@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const elements = {};
 let focused = null;
-for (const id of ['overlay', 'volume-fill', 'value', 'status', 'enable', 'disable', 'test', 'size-small', 'size-medium', 'size-large', 'check', 'result', 'result-title', 'result-detail']) {
+for (const id of ['overlay', 'volume-fill', 'value', 'status', 'enable', 'disable', 'test', 'size-small', 'size-medium', 'size-large', 'reset-steps', 'check', 'result', 'result-title', 'result-detail']) {
   elements[id] = { id, style: {}, className: '', textContent: '', focus() { focused = id; document.activeElement = this; } };
 }
 const storage = new Map([['earc.overlaySize', 'medium']]);
@@ -125,3 +125,14 @@ assert.equal(focused, 'size-small', 'down goes to the selected size');
 listeners.keydown({ keyCode: 39, preventDefault() {} });
 assert.equal(focused, 'size-medium');
 console.log('Overlay size tests passed');
+
+// Reset learning: runs the reset command and reports success.
+{
+  let sent = null;
+  window.earcRootExec = (command, cb) => { sent = command; cb(null, 'reset'); };
+  elements['reset-steps'].onclick();
+  assert.match(sent, /rm -rf "\/var\/lib\/earc-volume-steps"/);
+  assert.ok(sent.indexOf('kill') < sent.indexOf('rm -rf "/var/lib/earc-volume-steps"'), 'watcher stops before deleting');
+  assert.match(elements.status.textContent, /cleared/);
+  console.log('Reset learning tests passed');
+}

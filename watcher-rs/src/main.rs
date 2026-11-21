@@ -2,11 +2,15 @@
 //!
 //! Volume and mute come straight from the soundbar's HDMI-CEC Report Audio
 //! Status messages, read from the TV's CEC log as they are written. A volume
-//! key press shows the overlay at once with the last known level (dimmed);
-//! the soundbar's reply, which can take ~600 ms, fills in the real number.
+//! key press shows the overlay at once: with the next level when this
+//! soundbar's step from the current level has been learned and confirmed,
+//! otherwise with the last level dimmed until the soundbar's reply (which can
+//! take ~600 ms) fills in the real number. A reply that contradicts a learned
+//! step corrects the screen and relearns that step.
 
 mod cec;
 mod engine;
+mod learn;
 mod luna;
 
 use std::fs::OpenOptions;
@@ -21,6 +25,8 @@ pub use engine::{Engine, Show};
 const APP_ID: &str = "com.github.nikolay1243.earcvolume";
 const LOG_PATH: &str = "/tmp/earc-volume-overlay.log";
 const CEC_LOG: &str = "/var/log/cecmessages";
+/// Learned volume steps, one file per soundbar; removed by the setup screen's reset.
+const STEPS_DIR: &str = "/var/lib/earc-volume-steps";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -47,6 +53,8 @@ pub enum Event {
     /// The TV's master volume or mute changed. Used only as an activity
     /// trigger (and for mute) while polling; its number is never shown.
     Master { mute: bool },
+    /// The soundbar was identified by its CEC name (or vendor id).
+    Soundbar(learn::Name),
 }
 
 static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -207,6 +215,41 @@ impl Poller {
     }
 }
 
+fn steps_path(name: Option<learn::Name>) -> String {
+    format!("{}/{}.steps", STEPS_DIR, name.as_ref().map_or("unknown", |n| n.as_str()))
+}
+
+fn load_steps(name: Option<learn::Name>) -> learn::Steps {
+    std::fs::read_to_string(steps_path(name)).map(|t| learn::Steps::from_text(&t)).unwrap_or_default()
+}
+
+fn save_steps(name: Option<learn::Name>, steps: &learn::Steps) {
+    let path = steps_path(name);
+    let tmp = format!("{}.tmp", path);
+    let ok = std::fs::create_dir_all(STEPS_DIR).is_ok()
+        && std::fs::write(&tmp, steps.to_text()).is_ok()
+        && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        debug(&format!("could not save learned steps to {}", path));
+    }
+    if let Some(n) = name.filter(|n| n.strong) {
+        let _ = std::fs::write(format!("{}/last", STEPS_DIR), n.as_str());
+    }
+}
+
+/// Switches the engine to a soundbar's learned steps.
+fn use_soundbar(engine: &mut Engine, name: learn::Name) {
+    if engine.soundbar() == Some(name) {
+        return;
+    }
+    let steps = load_steps(Some(name));
+    log(&format!("soundbar {}: {} learned volume steps", name.as_str(), steps.len()));
+    engine.set_soundbar(name, steps);
+    if engine.take_steps_dirty() {
+        save_steps(Some(name), engine.steps());
+    }
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--version") {
         println!("earc-watcher {}", env!("CARGO_PKG_VERSION"));
@@ -229,6 +272,13 @@ fn main() {
     let launcher = Launcher::start();
     let poller = Poller::start(tx.clone());
     let mut engine = Engine::default();
+    // Start with the last identified soundbar; the CEC log may confirm or replace it.
+    if let Some(name) = std::fs::read_to_string(format!("{}/last", STEPS_DIR))
+        .ok()
+        .and_then(|t| learn::Name::new(&t, !t.starts_with("vendor-")))
+    {
+        use_soundbar(&mut engine, name);
+    }
     loop {
         let wait = engine.next_deadline(Instant::now()).unwrap_or(Duration::from_secs(3600));
         let result = match rx.recv_timeout(wait) {
@@ -241,6 +291,7 @@ fn main() {
                     Event::Output(false) if engine.on_arc() => log("sound output is not ARC/eARC"),
                     Event::CecLog(present) => log(if present { "CEC log available" } else { "CEC log not found" }),
                     Event::Key(_) | Event::Master { .. } => poller.activity(),
+                    Event::Soundbar(name) => use_soundbar(&mut engine, name),
                     _ => {}
                 }
                 engine.handle(event, Instant::now())
@@ -250,6 +301,9 @@ fn main() {
         };
         poller.set_enabled(engine.wants_polling());
         poller.set_starved(engine.starved());
+        if engine.take_steps_dirty() {
+            save_steps(engine.soundbar(), engine.steps());
+        }
         if let Some(show) = result {
             debug(&format!("show {:?}", show));
             launcher.show(show);

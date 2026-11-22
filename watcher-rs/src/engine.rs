@@ -65,6 +65,9 @@ pub struct Engine {
     steps_dirty: bool,
     /// Predicted level after the presses in flight; None when unknown.
     virtual_level: Option<u8>,
+    /// A press went unanswered, so the soundbar may be at a different level
+    /// than `volume`; nothing is learned until it reports again.
+    volume_stale: bool,
 }
 
 impl Engine {
@@ -141,7 +144,7 @@ impl Engine {
             _ => None,
         };
         let from = if self.presses.is_empty() { self.volume } else { self.virtual_level };
-        let from_confirmed = self.presses.is_empty() && self.volume.is_some();
+        let from_confirmed = self.presses.is_empty() && self.volume.is_some() && !self.volume_stale;
         let predicted = match (from, dir) {
             (Some(level), Some(d)) if !self.mute => self.steps.predict(level, d),
             _ => None,
@@ -169,6 +172,13 @@ impl Engine {
                 self.unanswered = 0;
                 self.silent = 0;
                 self.last_polled = None;
+                let stale = std::mem::take(&mut self.volume_stale);
+                if stale {
+                    // Learning resumes from this confirmed level, not this answer.
+                    for p in &mut self.presses {
+                        p.from_confirmed = false;
+                    }
+                }
                 if let Some(true) = self.answer(volume, mute) {
                     // The level shown in advance was right; nothing to update.
                     if self.presses.is_empty() {
@@ -262,6 +272,9 @@ impl Engine {
         self.unanswered = self.unanswered.saturating_add(1);
         self.silent = self.silent.saturating_add(1);
         let predicted_shown = self.presses.iter().any(|p| p.predicted.is_some());
+        if !self.presses.is_empty() {
+            self.volume_stale = true;
+        }
         self.presses.clear();
         self.virtual_level = self.volume;
         if !self.allowed() || self.starved() || predicted_shown {
@@ -612,6 +625,25 @@ mod tests {
         let other = crate::learn::Name::new("HW-Q990B", true).unwrap();
         e.set_soundbar(other, crate::learn::Steps::default());
         assert_eq!(e.handle(Event::Key(Key::VolumeUp), ms(t0, 30000)).map(|s| s.pending), Some(true));
+    }
+
+    #[test]
+    fn missed_reply_does_not_teach_a_double_step() {
+        // Seen on the C3: a press from 8 got no reply (soundbar went to 6),
+        // the next press from "8" got 4, and 8 down -> 4 was learned.
+        let t0 = Instant::now();
+        let mut e = ready(t0, 8);
+        e.handle(Event::CecLog(true), t0);
+        let t = ms(t0, 5000);
+        e.handle(Event::Key(Key::VolumeDown), t);
+        e.tick(ms(t, 1500));
+        e.handle(Event::Key(Key::VolumeDown), ms(t, 3000));
+        e.handle(Event::Report { volume: 4, mute: false }, ms(t, 3600));
+        assert!(e.steps().is_empty(), "nothing learned across a missed reply");
+        // After that confirmed report, learning works again.
+        e.handle(Event::Key(Key::VolumeUp), ms(t, 6000));
+        e.handle(Event::Report { volume: 6, mute: false }, ms(t, 6600));
+        assert_eq!(e.steps().len(), 1);
     }
 }
 

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 
 // Release URLs follow the repository that builds them, so forks publish
 // manifests pointing at their own releases.
-const repository = process.env.GITHUB_REPOSITORY || 'Nikolay1243/Webos-EARC-Volume-Overlay';
+const repository = process.env.GITHUB_REPOSITORY || 'danzig666/Webos-EARC-Volume-Overlay';
 const branch = process.env.RELEASE_BRANCH || 'main';
 const version = JSON.parse(fs.readFileSync('app/appinfo.json')).version;
 const base = `https://github.com/${repository}/releases/download/v${version}`;
